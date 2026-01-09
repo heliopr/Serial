@@ -7,8 +7,8 @@ along with its type into instanceDefaults. Every time an instance is serialized,
 proceeds to create a new instance of that same class, and storing the defaults into instanceDefaults, and then it proceeds to save only
 those properties that have been modified.
 
-I have made simple benchmarks of this module and it seems to be able to serialize around 150k instances per second, while deserializing
-around 80k per second, on my computer of course.
+I have made simple benchmarks of this module and it seems to be able to serialize around 110k instances per second, while deserializing
+around 85k per second, on my computer of course.
 
 Examle usage:
 
@@ -47,6 +47,7 @@ local API_DUMP_URL = "https://setup.rbxcdn.com/%s-API-Dump.json" -- %s format
 
 -- SERVICES
 local HttpService = game:GetService("HttpService")
+local EncodingService = game:GetService("EncodingService")
 
 
 -- VARIABLES
@@ -56,6 +57,16 @@ local instanceableInstances = {} -- table used to quickly check if a class can b
 
 -- any primitive type can be defined in this way as they don't need any transformation to be stored in json (serializer and deserializer)
 local primitiveType = {function(deserialized) return deserialized end, function(serialized) return serialized end}
+
+-- converts a buffer to a base 64 encoded string, we can't call buffer.tostring(b) directly because it cant be encoded to JSON
+local function bToB64(b: buffer): string
+	return buffer.tostring(EncodingService:Base64Encode(b))
+end
+
+-- converts a base 64 encoded string to a buffer
+local function b64ToB(b64: string): buffer
+	return EncodingService:Base64Decode(buffer.fromstring(b64))
+end
 
 -- each value in this dictionary follows this pattern:
 -- {serializeFunction, deserializeFunction}
@@ -69,116 +80,230 @@ local TYPES = {
 	int64 = primitiveType,
 	float = primitiveType,
 	double = primitiveType,
-	bool = primitiveType,
+	-- converts a boolean value to a number
+	bool = {
+		function(d)
+			return if d then 1 else 0
+		end,
+		function(s)
+			return s == 1
+		end
+	},
 
 	Content = primitiveType,
 
-	-- converts NumberRange to a simple array {min, max}
-	NumberRange = {function(d)
-		return {d.Min, d.Max}
-	end,
-	function(s)
-		return NumberRange.new(s[1], s[2])
-	end,
+	-- converts NumberRange to a buffer
+	NumberRange = {
+		function(d)
+			local b = buffer.create(8)
+			buffer.writef32(b, 0, d.Min)
+			buffer.writef32(b, 4, d.Max)
+			return bToB64(b)
+		end,
+		function(s)
+			local b = b64ToB(s)
+			return NumberRange.new(buffer.readf32(b, 0), buffer.readf32(b, 4))
+		end
 	},
 
-	-- converts a Vector3 to an array {x, y, z}
-	Vector3 = {function(d)
-		return {d.X, d.Y, d.Z}
-	end,
-	function(s)
-		return Vector3.new(table.unpack(s))
-	end},
+	-- converts a Vector3 to a buffer
+	Vector3 = {
+		function(d)
+			local b = buffer.create(12) -- X, Y, Z, each using 4 bytes = 12 bytes
+			buffer.writef32(b, 0, d.X) -- first 4 bytes (0-3)
+			buffer.writef32(b, 4, d.Y) -- the other 4 bytes (4-7)
+			buffer.writef32(b, 8, d.Z) -- the last 4 bytes (8-11)
+			return bToB64(b)
+		end,
+		function(s)
+			local b = b64ToB(s)
+			return Vector3.new(buffer.readf32(b, 0), buffer.readf32(b, 4), buffer.readf32(b, 8))
+		end
+	},
 
-	-- CFrame <-> 12-number component array (cframe:GetComponents())
-	CFrame = {function(d)
-		return {d:GetComponents()}
-	end,
-	function(s)
-		return CFrame.new(table.unpack(s))
-	end,
+	-- CFrame <-> buffer
+	CFrame = {
+		function(d)
+			local b = buffer.create(48)
+			local x, y, z, R00, R01, R02, R10, R11, R12, R20, R21, R22 = d:GetComponents() -- GetComponents returns 12 values
+			buffer.writef32(b, 0, x) -- store all 12 components into the buffer:
+			buffer.writef32(b, 4, y)
+			buffer.writef32(b, 8, z)
+			buffer.writef32(b, 12, R00)
+			buffer.writef32(b, 16, R01)
+			buffer.writef32(b, 20, R02)
+			buffer.writef32(b, 24, R10)
+			buffer.writef32(b, 28, R11)
+			buffer.writef32(b, 32, R12)
+			buffer.writef32(b, 36, R20)
+			buffer.writef32(b, 40, R21)
+			buffer.writef32(b, 44, R22)
+			return bToB64(b)
+		end,
+		function(s)
+			local b = b64ToB(s)
+			return CFrame.new(
+				buffer.readf32(b, 0), buffer.readf32(b, 4), buffer.readf32(b, 8),
+				buffer.readf32(b, 12), buffer.readf32(b, 16), buffer.readf32(b, 20),
+				buffer.readf32(b, 24), buffer.readf32(b, 28), buffer.readf32(b, 32),
+				buffer.readf32(b, 36), buffer.readf32(b, 40), buffer.readf32(b, 44)
+			)
+		end
 	},
 
 	-- each BrickColor has a name so it is just stored as a string
-	BrickColor = {function(d)
-		return tostring(d)
-	end,
-	function(s)
-		return BrickColor.new(s)
-	end,
+	BrickColor = {
+		function(d)
+			return tostring(d)
+		end,
+		function(s)
+			return BrickColor.new(s)
+		end,
 	},
 
-	-- converts Color3 to an array {r, g, b}
-	Color3 = {function(d)
-		return {d.R, d.G, d.B}
-	end,
-	function(s)
-		return Color3.new(table.unpack(s))
-	end,
+	-- converts Color3 to a 3 byte buffer
+	Color3 = {
+		function(d)
+			local b = buffer.create(3)
+			buffer.writeu8(b, 0, math.round(d.R*255))
+			buffer.writeu8(b, 1, math.round(d.G*255))
+			buffer.writeu8(b, 2, math.round(d.B*255))
+			return bToB64(b)
+		end,
+		function(s)
+			local b = b64ToB(s)
+			return Color3.new(buffer.readu8(b, 0)/255, buffer.readu8(b, 1)/255, buffer.readu8(b, 2)/255)
+		end
 	},
 
-	Vector2 = {function(d)
-		return {d.X, d.Y}
-	end,
-	function(s)
-		return Vector2.new(table.unpack(s))
-	end,
+	Vector2 = {
+		function(d)
+			local b = buffer.create(8)
+			buffer.writef32(b, 0, d.X)
+			buffer.writef32(b, 4, d.Y)
+			return bToB64(b)
+		end,
+		function(s)
+			local b = b64ToB(s)
+			return Vector2.new(buffer.readf32(b, 0), buffer.readf32(b, 4))
+		end
 	},
 
 	-- enums are stored as strings ex: "Enum.Material.Plastic"
-	Enum = {function(d)
-		return tostring(d)
-	end,
-	function(s)
-		local split = string.split(s, ".")
-		return Enum[split[2]][split[3]]
-	end},
-
-	-- this property might be nil sometimes (i figured this out after 3 hours of pain and suffering :skull:)
-	PhysicalProperties = {function(d)
-		return if d then {d.Density, d.Friction, d.Elasticity, d.FrictionWeight, d.ElasticityWeight} else nil
-	end,
-	function(s)
-		return if s then PhysicalProperties.new(table.unpack(s)) else nil
-	end,
+	Enum = {
+		function(d)
+			return tostring(d)
+		end,
+		function(s)
+			local split = string.split(s, ".")
+			return Enum[split[2]][split[3]]
+		end
+	},
+	
+	-- converts a PhysicalProperties value to a buffer and vice versa
+	PhysicalProperties = {
+		function(d)
+			if (not d) then -- this property might be nil sometimes (i figured this out after 3 hours of pain and suffering :skull:)
+				return nil
+			end
+			local b = buffer.create(20)
+			buffer.writef32(b, 0, d.Density)
+			buffer.writef32(b, 4, d.Friction)
+			buffer.writef32(b, 8, d.Elasticity)
+			buffer.writef32(b, 12, d.FrictionWeight)
+			buffer.writef32(b, 16, d.ElasticityWeight)
+			return bToB64(b)
+		end,
+		function(s)
+			if (not s) then
+				return nil
+			end
+			local b = b64ToB(s)
+			return PhysicalProperties.new(
+				buffer.readf32(b, 0),
+				buffer.readf32(b, 4),
+				buffer.readf32(b, 8),
+				buffer.readf32(b, 12),
+				buffer.readf32(b, 16)
+			)
+		end
 	},
 
 	-- NumberSequences can be stored by their keypoints
-	NumberSequence = {function(d)
-		local s = {}
-		for i, v in pairs(d.Keypoints) do
-			table.insert(s, {v.Time, v.Value, v.Envelope})
+	NumberSequence = {
+		function(d)
+			local kp = d.Keypoints
+			local count = #kp
+			local size = 4 + (count * 12) -- 4 bytes for count, 12 bytes per keypoint
+			local b = buffer.create(size)
+
+			buffer.writeu32(b, 0, count)
+
+			local offset = 4
+			for i, v in ipairs(kp) do -- store each keypoint in the buffer
+				local v = v.Value
+				buffer.writef32(b, offset, v.Time)
+				buffer.writef32(b, offset + 4, v.Value)
+				buffer.writef32(b, offset + 8, v.Envelope)
+				offset += 12
+			end
+			return bToB64(b)
+		end,
+		function(s)
+			local b = b64ToB(s)
+			local count = buffer.readu32(b, 0) -- the first 4 bytes are used for counting
+			local keypoints = table.create(count)
+
+			local offset = 4
+			for i = 1, count do
+				local t = buffer.readf32(b, offset)
+				local v = buffer.readf32(b, offset + 4)
+				local e = buffer.readf32(b, offset + 8)
+				table.insert(keypoints, NumberSequenceKeypoint.new(t, v, e))
+				offset += 12
+			end
+			return NumberSequence.new(keypoints)
 		end
-		return s
-	end,
-	function(s)
-		local d = {}
-		for i, v in pairs(s) do
-			table.insert(d, NumberSequenceKeypoint.new(v[1], v[2], v[3]))
+	},
+	
+	-- there isn't really a better way to store a font other than a table
+	Font = {
+		function(d)
+			return {d.Family, tostring(d.Weight):split(".")[3], tostring(d.Style):split(".")[3]}
+		end,
+		function(s)
+			return Font.new(s[1], Enum.FontWeight[s[2]], Enum.FontStyle[s[3]])
+		end,
+	},
+	
+	-- converts a UDim2 to a buffer and vice versa
+	UDim2 = {
+		function(d)
+			local b = buffer.create(16)
+			buffer.writef32(b, 0, d.X.Scale)
+			buffer.writef32(b, 4, d.X.Offset)
+			buffer.writef32(b, 8, d.Y.Scale)
+			buffer.writef32(b, 12, d.Y.Offset)
+			return bToB64(b)
+		end,
+		function(s)
+			local b = b64ToB(s)
+			return UDim2.new(buffer.readf32(b, 0), buffer.readf32(b, 4),  buffer.readf32(b, 8), buffer.readf32(b, 12))
 		end
-		return NumberSequence.new(d)
-	end,},
+	},
 
-	Font = {function(d)
-		return {d.Family, tostring(d.Weight):split(".")[3], tostring(d.Style):split(".")[3]}
-	end,
-	function(s)
-		return Font.new(s[1], Enum.FontWeight[s[2]], Enum.FontStyle[s[3]])
-	end,},
-
-	UDim2 = {function(d)
-		return {d.X.Scale, d.X.Offset, d.Y.Scale, d.Y.Offset}
-	end,
-	function(s)
-		return UDim2.new(s[1], s[2], s[3], s[4])
-	end,},
-
-	UDim = {function(d)
-		return {d.Scale, d.Offset}
-	end,
-	function(s)
-		return UDim.new(s[1], s[2])
-	end,}
+	UDim = {
+		function(d)
+			local b = buffer.create(8)
+			buffer.writef32(b, 0, d.Scale)
+			buffer.writef32(b, 4, d.Offset)
+			return bToB64(b)
+		end,
+		function(s)
+			local b = b64ToB(s)
+			return UDim.new(buffer.readf32(b, 0), buffer.readf32(b, 4))
+		end
+	}
 }
 
 local IGNORE_PROPERTIES = {"Parent"} -- this property can be ignored because it is handled in another way
@@ -186,20 +311,20 @@ local IGNORE_PROPERTIES = {"Parent"} -- this property can be ignored because it 
 -- FUNCTIONS
 
 -- helper functions to apply the irght transformation function for a specific type
-local function serializeValue(value: any, vtype: string)
+local function serializeValue(value: any, vtype: string): any
 	local t = TYPES[vtype]
 	if (not t) then warn("Unknown type "..tostring(vtype)) return value end
 	return t[1](value)
 end
 
-local function deserializeValue(value: any, vtype: string)
+local function deserializeValue(value: any, vtype: string): any
 	local t = TYPES[vtype]
 	if (not t) then warn("Unknown type "..tostring(vtype)) return value end
 	return t[2](value)
 end
 
 -- copies any table recursively
-local function tableClone(tbl)
+local function tableClone(tbl: {[any]: any}): {[any]: any}
 	local clone = table.clone(tbl)
 	for i, v in pairs(clone) do
 		if (type(v) == "table") then
@@ -210,7 +335,7 @@ local function tableClone(tbl)
 end
 
 -- copies any key of super that is not in dest (basically applies inheritance)
-local function tableApplySuper(dest, super)
+local function tableApplySuper(dest: {[any]: any}, super: {[any]: any}): {[any]: any}
 	for i, v in pairs(super) do
 		if (dest[i] == nil) then
 			dest[i] = tableClone(super[i])
@@ -219,7 +344,7 @@ local function tableApplySuper(dest, super)
 end
 
 -- fetches the latest Studio version, used in the api dump
-local function getAPIVersion()
+local function getAPIVersion(): string
 	local response = HttpService:GetAsync(API_CURRENT_VERSION_URL)
 	return response
 end
@@ -303,7 +428,7 @@ local function processAPIDump()
 end
 
 -- converts a single Instance into a serialized table
-local function serializeInstance(instance: Instance)
+local function serializeInstance(instance: Instance): {[any]: any}
 	local instanceType = instance.ClassName
 	if (not table.find(instanceableInstances, instanceType)) then return nil end
 	local serialized = {Type = instanceType, Properties = {}}
@@ -340,7 +465,7 @@ local function serializeInstance(instance: Instance)
 end
 
 -- serializes the object children recursively
-local function serializeInstanceRecursive(instance: Instance, id: number, lookup)
+local function serializeInstanceRecursive(instance: Instance, id: number, lookup: {[any]: any}): ({[any]: any}, number)
 	id = id or 1
 	local serialized = serializeInstance(instance)
 	if (not serialized) then return nil, id end
@@ -364,7 +489,7 @@ local function serializeInstanceRecursive(instance: Instance, id: number, lookup
 end
 
 -- we can't save a real object in JSON so instead, we save the unique id of the target object so we can relink it during deserialization
-local function serializeInstanceProperties(lookup, ancestor: Instance)
+local function serializeInstanceProperties(lookup: {[any]: any}, ancestor: Instance)
 	-- this serializes all of the instance reference properties
 	for i, s in pairs(lookup) do
 		for p, v in pairs(instanceDefaults[s.Type]) do
@@ -429,7 +554,7 @@ local function deserializeInstanceRecursive(serialized: {[any]: any}, parent: In
 end
 
 -- final pass: now that all instances exist, we go back and set properties that refer to other instances
-local function deserializeInstanceProperties(lookup)
+local function deserializeInstanceProperties(lookup: {[any]: any})
 	for i, v in pairs(lookup) do
 		local instance = v[1]
 		local serialized = v[2]
@@ -450,7 +575,7 @@ end
 -- PUBLIC API
 local Serial = {}
 
--- must be called once to prepare the system
+-- Must be called once to prepare the system
 function Serial.GetLatestAPIDump()
 	local apiVersion = getAPIVersion()
 	getAPIDumpRaw(apiVersion)
@@ -459,10 +584,15 @@ function Serial.GetLatestAPIDump()
 	apiDumpRaw = nil -- free memory, apiDumpRaw is useless after being processed
 end
 
--- TODO
---[[function Serial.LoadCachedDefaults()
+-- Loads cached api dump
+function Serial.LoadCachedDump()
+	local cachedAPIDump = script:FindFirstChild("CachedAPIDump")
+	assert(cachedAPIDump, "Could not find cached api dump")
 	
-end]]
+	cachedAPIDump = require(cachedAPIDump)
+	instanceableInstances = cachedAPIDump["instanceableInstances"]
+	instanceDefaults = cachedAPIDump["instanceDefaults"]
+end
 
 -- Takes an instance and serializes its properties into a table
 function Serial.SerializeInstance(instance: Instance): {[any]: any}
